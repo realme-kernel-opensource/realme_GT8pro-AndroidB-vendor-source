@@ -1,0 +1,232 @@
+#include <linux/version.h>
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/string.h>
+#include <linux/sched.h>
+#include <linux/ioprio.h>
+#include <linux/blk-mq.h>
+#include <linux/sa_common.h>
+
+#include <trace/hooks/wqlockup.h>
+#include <trace/hooks/blk.h>
+#include "oplus_wq_dynamic_priority.h"
+
+#define VIRTUAL_KWORKER_NORMAL_NICE (-1000)
+#define VIRTUAL_KWORKER_KBLOCKD_NICE (-1001)
+#define WQ_CMP(str)  (strncmp(wq->name, str, sizeof(str) - 1) == 0)
+
+static struct workqueue_attrs *ux_wq_attrs;
+static struct workqueue_attrs *ux_wq_attrs_kblockd;
+static struct workqueue_struct *oplus_kblockd_workqueue;
+
+static void android_rvh_alloc_and_link_pwqs_handler(void *unused,
+	struct workqueue_struct *wq, int *ret, bool *skip)
+{
+	if (WQ_CMP("loop") || WQ_CMP("kverityd")) {
+		*ret = apply_workqueue_attrs_locked(wq, ux_wq_attrs);
+		*skip = true;
+	} else if (WQ_CMP("opluskblockd")) {
+		*ret = apply_workqueue_attrs_locked(wq, ux_wq_attrs_kblockd);
+		*skip = true;
+	}
+}
+
+static void android_rvh_alloc_workqueue_handler(void *unused,
+	struct workqueue_struct *wq, unsigned int *flags, int *max_active)
+{
+	if (WQ_CMP("loop") || WQ_CMP("kverityd") || WQ_CMP("opluskblockd")) {
+		if (!wq->unbound_attrs){
+			wq->unbound_attrs = alloc_workqueue_attrs();
+			if (!wq->unbound_attrs) {
+				pr_err("%s alloc_workqueue_attrs failed: %s", __func__, wq->name);
+				return;
+			}
+		}
+		*flags |= (WQ_UNBOUND | WQ_HIGHPRI);
+		if (*max_active == 1)
+			*flags |= __WQ_ORDERED;
+	}
+}
+
+static void android_rvh_create_worker_handler(void *unused,
+	struct task_struct *task, struct workqueue_attrs *attrs)
+{
+	if (attrs->nice == VIRTUAL_KWORKER_NORMAL_NICE ||
+		attrs->nice == VIRTUAL_KWORKER_KBLOCKD_NICE) {
+                oplus_set_ux_state_lock(task, SA_TYPE_LIGHT, -1, true);
+		if (task->comm[8] == 'u')
+			task->comm[8] = 'X';
+	}
+}
+
+static void android_vh_blk_mq_kick_requeue_list_handler(void *unused,
+	struct request_queue *q, unsigned long delay, bool *skip)
+{
+	mod_delayed_work_on(WORK_CPU_UNBOUND, oplus_kblockd_workqueue,
+		&q->requeue_work, 0);
+	*skip = 1;
+	return;
+}
+
+static void android_vh_blk_mq_delay_run_hw_queue_handler(void *unused,
+	int cpu, struct blk_mq_hw_ctx *hctx, unsigned long delay, bool *skip)
+{
+	mod_delayed_work_on(cpu, oplus_kblockd_workqueue, &hctx->run_work, delay);
+	*skip = 1;
+	return;
+}
+
+struct tracepoints_table {
+	const char *name;
+	void *func;
+	struct tracepoint *tp;
+	bool init;
+};
+
+static struct tracepoints_table interests[] = {
+	{
+		.name = "android_rvh_alloc_and_link_pwqs",
+		.func = android_rvh_alloc_and_link_pwqs_handler
+	},
+	{
+		.name = "android_rvh_alloc_workqueue",
+		.func = android_rvh_alloc_workqueue_handler
+	},
+	{
+		.name = "android_rvh_create_worker",
+		.func = android_rvh_create_worker_handler
+	},
+	{
+		.name = "android_vh_blk_mq_delay_run_hw_queue",
+		.func = android_vh_blk_mq_delay_run_hw_queue_handler
+	},
+	{
+		.name = "android_vh_blk_mq_kick_requeue_list",
+		.func = android_vh_blk_mq_kick_requeue_list_handler
+	},
+};
+
+#define FOR_EACH_INTEREST(i) \
+	for (i = 0; i < sizeof(interests) / sizeof(struct tracepoints_table); \
+	i++)
+
+static void lookup_tracepoints(struct tracepoint *tp,
+				       void *ignore)
+{
+	int i;
+
+	FOR_EACH_INTEREST(i) {
+		if (strcmp(interests[i].name, tp->name) == 0)
+			interests[i].tp = tp;
+	}
+}
+
+static int wq_install_tracepoints(int start, int end)
+{
+	int i;
+	int cnt = sizeof(interests) / sizeof(struct tracepoints_table);
+
+	if (end > cnt) {
+		pr_warn("%s: err: tracepoint end > tp cnt\n",
+				THIS_MODULE->name);
+		end = cnt;
+	}
+
+	for (i = start; i <= end; i++) {
+		if (interests[i].tp == NULL) {
+			pr_err("%s: tracepoint %s not found\n",
+				THIS_MODULE->name, interests[i].name);
+			return -1;
+		}
+
+		if (!interests[i].init) {
+			tracepoint_probe_register(interests[i].tp,
+						interests[i].func,
+						NULL);
+			interests[i].init = true;
+		}
+	}
+
+	return 0;
+}
+
+static void wq_uninstall_tracepoints(void)
+{
+	int i;
+
+	FOR_EACH_INTEREST(i) {
+		if (interests[i].init) {
+			tracepoint_probe_unregister(interests[i].tp,
+						    interests[i].func,
+						    NULL);
+		}
+	}
+}
+
+static int __init oplus_wq_hook_init(void)
+{
+	int err = 0;
+
+	/* Install the tracepoints */
+	for_each_kernel_tracepoint(lookup_tracepoints, NULL);
+
+	ux_wq_attrs = alloc_workqueue_attrs();
+	if (!ux_wq_attrs) {
+		pr_err("%s alloc ux_wq_attrs fail!",__func__);
+		err = -ENOMEM;
+		goto out;
+	} else
+		ux_wq_attrs->nice = VIRTUAL_KWORKER_NORMAL_NICE;
+
+	ux_wq_attrs_kblockd = alloc_workqueue_attrs();
+	if (!ux_wq_attrs_kblockd) {
+		pr_err("%s alloc ux_wq_attrs_kblockd fail!",__func__);
+		err = -ENOMEM;
+		goto err_free_attrs;
+	} else
+		ux_wq_attrs_kblockd->nice = VIRTUAL_KWORKER_KBLOCKD_NICE;
+
+	err = wq_install_tracepoints(0, 2);
+	if (err)
+		goto err_free_kblockd_attrs;
+
+	oplus_kblockd_workqueue =  alloc_workqueue("opluskblockd",
+  					    WQ_MEM_RECLAIM | WQ_HIGHPRI | WQ_UNBOUND, 0);
+
+	if (!oplus_kblockd_workqueue) {
+		err = -ENOMEM;
+		pr_err("%s alloc opluskblockd fail!",__func__);
+		goto err_free_kblockd_attrs;
+	}
+
+	err = wq_install_tracepoints(3, 4);
+	if (err)
+		goto err_free_wq;
+
+	return err;
+
+err_free_wq:
+	destroy_workqueue(oplus_kblockd_workqueue);
+err_free_kblockd_attrs:
+	free_workqueue_attrs(ux_wq_attrs_kblockd);
+err_free_attrs:
+	free_workqueue_attrs(ux_wq_attrs);
+out:
+    return err;
+}
+
+static void __exit oplus_wq_hook_exit(void)
+{
+	destroy_workqueue(oplus_kblockd_workqueue);
+	wq_uninstall_tracepoints();
+	free_workqueue_attrs(ux_wq_attrs);
+	free_workqueue_attrs(ux_wq_attrs_kblockd);
+}
+
+module_init(oplus_wq_hook_init);
+module_exit(oplus_wq_hook_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("lijiang");
+MODULE_AUTHOR("Gray Jia");
+MODULE_DESCRIPTION("A kernel module using vendorhook to improve IO performance");
